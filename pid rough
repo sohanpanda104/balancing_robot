@@ -1,26 +1,28 @@
-#include <AccelStepper.h>
 #include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 // === Motor Pins ===
-#define DIR_PIN_A 2
-#define STEP_PIN_A 3
-#define DIR_PIN_B 4
-#define STEP_PIN_B 5
+const int stepPin1 = 3;
+const int dirPin1 = 6;
+const int enPin1 = 8;
 
-#define MOTOR_INTERFACE_TYPE 1
+const int stepPin2 = 5;
+const int dirPin2 = 4;
+const int enPin2 = 9;
 
-AccelStepper motorA(MOTOR_INTERFACE_TYPE, STEP_PIN_A, DIR_PIN_A);
-AccelStepper motorB(MOTOR_INTERFACE_TYPE, STEP_PIN_B, DIR_PIN_B);
+// === MPU6050 Setup ===
+Adafruit_MPU6050 mpu;
 
-// === MPU6050 ===
-const int MPU = 0x68;
+// === Filter parameters ===
+float alpha = 0.96;
 
-float AccelY, AccelZ, GyroX;
-float angle_accel = 0;
-float angle_gyro = 0;
-float angle_complementary = 0;
+// === Orientation angles ===
+float roll_accel, roll_gyro = 0, roll_filter = 0;
 
-unsigned long prevTime;
+// === Calibration offsets ===
+float gyroY_offset = 0;
+float accelX_offset = 0, accelY_offset = 0, accelZ_offset = 0;
 
 // === PID Variables ===
 float setpoint = 0.0;
@@ -29,85 +31,145 @@ float integral = 0;
 float derivative;
 float output;
 
-// === PID Tuning ===
+// === PID Tuning (adjust these values) ===
 float Kp = 15.0;
 float Ki = 0.0;
 float Kd = 1.2;
 
+// Timing
+unsigned long prevTime;
+
+// === Function to calibrate the sensors ===
+void calibrateSensors() {
+  const int samples = 500;
+  float sum_gy = 0;
+  float sum_ax = 0, sum_ay = 0, sum_az = 0;
+
+  Serial.println("Calibrating... Keep the sensor still!");
+
+  for (int i = 0; i < samples; i++) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    sum_gy += g.gyro.y;
+
+    sum_ax += a.acceleration.x;
+    sum_ay += a.acceleration.y;
+    sum_az += a.acceleration.z;
+
+    delay(5);
+  }
+
+  gyroY_offset = sum_gy / samples;
+  accelX_offset = sum_ax / samples;
+  accelY_offset = sum_ay / samples;
+  accelZ_offset = (sum_az / samples) - 9.81; // assuming flat stationary surface
+
+  Serial.println("Calibration complete!");
+}
+
+// === Setup ===
 void setup() {
+  Serial.begin(115200);
   Wire.begin();
-  Serial.begin(9600);
 
-  // MPU6050: Wake up
-  Wire.beginTransmission(MPU);
-  Wire.write(0x6B);
-  Wire.write(0);
-  Wire.endTransmission(true);
+  // Initialize MPU6050
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip!");
+    while (1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
-  // Motors
-  motorA.setMaxSpeed(1000);
-  motorA.setAcceleration(1000);
-  motorB.setMaxSpeed(1000);
-  motorB.setAcceleration(1000);
+  delay(1000); // Stabilize
+  calibrateSensors();
+
+  // Motor Pins Setup
+  pinMode(stepPin1, OUTPUT);
+  pinMode(dirPin1, OUTPUT);
+  pinMode(enPin1, OUTPUT);
+
+  pinMode(stepPin2, OUTPUT);
+  pinMode(dirPin2, OUTPUT);
+  pinMode(enPin2, OUTPUT);
+
+  digitalWrite(enPin1, LOW); // Enable motors
+  digitalWrite(enPin2, LOW);
 
   prevTime = millis();
 }
 
+// === Motor Control Function ===
+void stepMotors(float speed) {
+  static unsigned long lastStepTime = 0;
+
+  float absSpeed = abs(speed);
+  unsigned long interval = (absSpeed > 0) ? (1000000.0 / absSpeed) : 1000000;
+
+  if (micros() - lastStepTime >= interval) {
+    lastStepTime = micros();
+
+    digitalWrite(stepPin1, HIGH);
+    digitalWrite(stepPin2, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(stepPin1, LOW);
+    digitalWrite(stepPin2, LOW);
+  }
+
+  // Motor 1: Normal
+  // Motor 2: Flipped direction
+  if (speed >= 0) {
+    digitalWrite(dirPin1, HIGH);
+    digitalWrite(dirPin2, LOW);  // Inverted
+  } else {
+    digitalWrite(dirPin1, LOW);
+    digitalWrite(dirPin2, HIGH); // Inverted
+  }
+}
+
+// === Main Loop ===
 void loop() {
-  // === Read MPU6050 ===
-  Wire.beginTransmission(MPU);
-  Wire.write(0x3B); // ACCEL_YOUT_H
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU, 14, true);
-
-  Wire.read(); Wire.read(); // Skip Ax
-  int16_t rawAy = Wire.read() << 8 | Wire.read();
-  int16_t rawAz = Wire.read() << 8 | Wire.read();
-  Wire.read(); Wire.read(); // Skip Temp
-  int16_t rawGx = Wire.read() << 8 | Wire.read();
-  Wire.read(); Wire.read(); // Skip GyY, GyZ
-
-  // === Convert Units ===
-  AccelY = rawAy / 16384.0;
-  AccelZ = rawAz / 16384.0;
-  GyroX = rawGx / 131.0; // degrees/sec
-
-  // === Accelerometer Angle ===
-  angle_accel = atan2(AccelY, AccelZ) * 180 / PI;
-
-  // === Time Delta ===
   unsigned long currentTime = millis();
-  float dt = (currentTime - prevTime) / 1000.0;
+  float dt = (currentTime - prevTime) / 1000.0; // in seconds
   prevTime = currentTime;
 
-  // === Gyroscope Integration ===
-  angle_gyro += GyroX * dt;
+  // Read Sensor Data
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
 
-  // === Complementary Filter ===
-  float alpha = 0.98;
-  angle_complementary = alpha * (angle_complementary + GyroX * dt) + (1 - alpha) * angle_accel;
+  // Apply Calibration Offsets
+  float corrected_ax = a.acceleration.x - accelX_offset;
+  float corrected_ay = a.acceleration.y - accelY_offset;
+  float corrected_az = a.acceleration.z - accelZ_offset;
+
+  float corrected_gy = g.gyro.y - gyroY_offset;
+
+  // Calculate roll angle from accelerometer
+  roll_accel = atan2(-corrected_ax, sqrt(corrected_ay * corrected_ay + corrected_az * corrected_az)) * 180 / PI;
+
+  // Integrate gyroscope data
+  roll_gyro += corrected_gy * dt * 180 / PI;
+
+  // Complementary filter to combine both
+  roll_filter = alpha * (roll_filter + corrected_gy * dt * 180 / PI) + (1 - alpha) * roll_accel;
 
   // === PID Controller ===
-  error = setpoint - angle_complementary;
+  error = setpoint - roll_filter;
   integral += error * dt;
   derivative = (error - previous_error) / dt;
   output = Kp * error + Ki * integral + Kd * derivative;
   previous_error = error;
 
   // === Control Motors ===
-  // Opposite directions to balance
-  motorA.setSpeed(output);
-  motorB.setSpeed(-output);
+  stepMotors(output);
 
-  motorA.runSpeed();
-  motorB.runSpeed();
-
-  // === Debugging ===
-  Serial.print("Angle: ");
-  Serial.print(angle_complementary);
-  Serial.print(" | PID: ");
+  // === Debugging output ===
+  Serial.print("Roll: ");
+  Serial.print(roll_filter);
+  Serial.print(" | PID Output: ");
   Serial.println(output);
 
-  // Optional: limit loop to ~100 Hz
-  while (millis() - currentTime < 10);
+  // Maintain roughly 100Hz loop rate
+  delay(10);
 }
