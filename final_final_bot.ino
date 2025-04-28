@@ -29,9 +29,9 @@ float input;    // Current tilt angle (roll_filter)
 float output;   // PID output (motor command)
 float setpoint = 0.0; // Upright
 
-float Kp = 390.0;
-float Ki = 0.05;
-float Kd = 1.00;
+float Kp = 700.0;
+float Ki = 0.02;
+float Kd = 60.00;
 
 float lastError = 0.0;
 float integral = 0.0;
